@@ -26,7 +26,21 @@ const (
 	ReasonRetryExhausted FailureReason = "RetryExhausted"
 	// ReasonConflictLoop means the object kept changing under us.
 	ReasonConflictLoop FailureReason = "ConflictLoop"
+	// ReasonDependencyMissing means the object references a dependency that
+	// does not exist. It is a distinguishable terminal conclusion for the
+	// current generation; creating the dependency revives the object.
+	ReasonDependencyMissing FailureReason = "DependencyMissing"
+	// ReasonDependencyCycle means the object's declarations participate in a
+	// dependency cycle that can never become ready under the current graph.
+	ReasonDependencyCycle FailureReason = "DependencyCycle"
 )
+
+// GuardFinalizer is the engine-managed finalizer that enforces reverse
+// deletion order: it is added to every live object that currently has
+// dependents, so such an object cannot physically disappear until its
+// dependents have been deleted. It is removed automatically once no
+// dependent remains, without app reconciler cooperation.
+const GuardFinalizer = "reconcile-engine.io/dependency-guard"
 
 // TerminalFailure records the distinguishable outcome of an exhausted key.
 type TerminalFailure struct {

@@ -63,19 +63,29 @@ func (r *appReconciler) Reconcile(ctx context.Context, obj *object.Object) (reco
 	// Active phase: ensure finalizer + converge status to spec idempotently.
 	changed := !obj.HasFinalizer(finalizerName) || !mapsEqual(obj.Spec, obj.Status)
 	if !changed {
-		fmt.Printf("    [reconcile #%d] judgment: already converged, no side effect\n", n)
+		// Already converged: report ready so dependents can proceed.
+		if !obj.Ready {
+			if _, err := r.s.Update(ctx, obj.Key(), obj.ResourceVersion, func(o *object.Object) {
+				o.Ready = true
+			}); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			fmt.Printf("    [reconcile #%d] judgment: already converged & ready, no side effect\n", n)
+		}
 		return reconcile.Result{}, nil
 	}
 	_, err := r.s.Update(ctx, obj.Key(), obj.ResourceVersion, func(o *object.Object) {
 		o.AddFinalizer(finalizerName)
 		o.Status = cloneMap(o.Spec)
+		o.Ready = true
 	})
 	if err != nil {
 		// A conflict means we based the write on a stale version; the
 		// controller will re-read and retry.
 		return reconcile.Result{}, err
 	}
-	fmt.Printf("    [reconcile #%d] judgment: applied desired state (status=spec, finalizer added)\n", n)
+	fmt.Printf("    [reconcile #%d] judgment: applied desired state (status=spec, finalizer added, ready)\n", n)
 	return reconcile.Result{}, nil
 }
 
@@ -151,9 +161,72 @@ func main() {
 		fmt.Println(">>> ERROR: object still present")
 	}
 
+	// ------------------------------------------------------------------
+	// Dependency orchestration: order child -> database (the child cannot
+	// converge until the database exists AND is ready).
+	// ------------------------------------------------------------------
+	fmt.Println("\n=== dependency orchestration ===")
+	dbKey := object.MakeKey("default", "database")
+	childKey := object.MakeKey("default", "child")
+
+	// Create the child first, referencing a database that is not ready yet.
+	mustCreate(s, &object.Object{
+		Namespace: "default", Name: "child",
+		Spec: map[string]string{"app": "1"},
+		Dependencies: []object.DependencyRef{
+			{Namespace: "default", Name: "database"},
+		},
+	})
+	fmt.Println(">>> created child -> database while database is absent (child waits/terminal-missing)")
+	time.Sleep(80 * time.Millisecond)
+	if f := ctrl.Failures()[childKey]; f != nil {
+		fmt.Printf(">>> observable conclusion while dependency missing: %v\n", f)
+	}
+
+	mustCreate(s, &object.Object{Namespace: "default", Name: "database", Spec: map[string]string{"v": "1"}})
+	fmt.Println(">>> database created; once it is ready the child auto-proceeds")
+	time.Sleep(200 * time.Millisecond)
+	db := mustGet(s, dbKey)
+	ch := mustGet(s, childKey)
+	fmt.Printf(">>> database ready=%v finalizers=%v | child ready=%v\n",
+		db.Ready, db.Finalizers, ch.Ready)
+	fmt.Printf(">>> depended-on database carries guard finalizer: %v\n",
+		contains(db.Finalizers, reconcile.GuardFinalizer))
+
+	// Reverse-order deletion: deleting the database first must be blocked
+	// until the child (its dependent) is gone.
+	_, _ = s.Delete(ctx, dbKey, db.ResourceVersion)
+	fmt.Println(">>> requested database deletion while child still exists (it must be preserved)")
+	time.Sleep(120 * time.Millisecond)
+	if still, _ := s.Get(ctx, dbKey); still != nil {
+		fmt.Printf(">>> database preserved: deleting=%t guard=%v\n",
+			still.BeingDeleted(), contains(still.Finalizers, reconcile.GuardFinalizer))
+	}
+	cur := mustGet(s, childKey)
+	_, _ = s.Delete(ctx, childKey, cur.ResourceVersion)
+	fmt.Println(">>> deleting the child first")
+	time.Sleep(200 * time.Millisecond)
+	if _, err := s.Get(ctx, childKey); errors.Is(err, object.ErrNotFound) {
+		fmt.Println(">>> child removed")
+	}
+	if _, err := s.Get(ctx, dbKey); errors.Is(err, object.ErrNotFound) {
+		fmt.Println(">>> database removed only after its dependent cleared (reverse order)")
+	} else {
+		fmt.Println(">>> ERROR: database should be gone")
+	}
+
 	cancel()
 	time.Sleep(300 * time.Millisecond)
 	fmt.Println(">>> demo complete; terminal failures:", ctrl.Failures())
+}
+
+func contains(xs []string, x string) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }
 
 func mustCreate(s store.Store, o *object.Object) {

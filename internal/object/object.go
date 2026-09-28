@@ -14,6 +14,20 @@ import (
 // every finalizer has been removed.
 type DeletionTimestamp int64
 
+// DependencyRef names another object that the owning object depends on. A
+// dependent is allowed to reconcile only after every referenced dependency
+// exists AND reports ready. A namespace-less reference resolves inside the
+// owning object's namespace (the engine expands it at graph-build time).
+type DependencyRef struct {
+	Namespace string
+	Name      string
+}
+
+// Key renders the namespaced identity of the referenced object.
+func (r DependencyRef) Key() string {
+	return MakeKey(r.Namespace, r.Name)
+}
+
 // Object is a versioned resource. ResourceVersion is assigned and incremented
 // by the store on every successful write and is used for optimistic
 // concurrency control: callers present the version they read and a write
@@ -29,6 +43,16 @@ type Object struct {
 	Spec map[string]string
 	// Status is the observed/actual payload written by reconcilers.
 	Status map[string]string
+
+	// Dependencies are the other objects that must exist and be Ready before
+	// this object is allowed to reconcile while alive. The slice is part of
+	// desired state and declared by the producer of the object.
+	Dependencies []DependencyRef
+
+	// Ready is the reconciler-reported readiness signal. A dependency only
+	// unblocks its dependents once Ready is true; an object being deleted is
+	// never considered ready even if this flag stays set.
+	Ready bool
 
 	// Finalizers block physical deletion until each is removed.
 	Finalizers []string
@@ -103,6 +127,11 @@ func (o *Object) Clone() *Object {
 	for k, v := range o.Status {
 		cp.Status[k] = v
 	}
+	if o.Dependencies != nil {
+		cp.Dependencies = append([]DependencyRef(nil), o.Dependencies...)
+	} else {
+		cp.Dependencies = nil
+	}
 	if o.Finalizers != nil {
 		cp.Finalizers = append([]string(nil), o.Finalizers...)
 	} else {
@@ -113,8 +142,8 @@ func (o *Object) Clone() *Object {
 
 // String renders an audit-friendly one-line description.
 func (o *Object) String() string {
-	return fmt.Sprintf("Object(key=%s rv=%d deleting=%t finalizers=%v)",
-		o.Key(), o.ResourceVersion, o.BeingDeleted(), o.Finalizers)
+	return fmt.Sprintf("Object(key=%s rv=%d ready=%t deps=%d deleting=%t finalizers=%v)",
+		o.Key(), o.ResourceVersion, o.Ready, len(o.Dependencies), o.BeingDeleted(), o.Finalizers)
 }
 
 // ErrNotFound is returned by the store when no object exists for a key.

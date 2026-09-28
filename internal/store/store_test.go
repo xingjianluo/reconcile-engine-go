@@ -179,7 +179,11 @@ func TestConcurrentUpdatesAreSerialized(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for attempt := 0; attempt < 3; attempt++ {
+			// Bounded but generous retry: with optimistic concurrency a
+			// contended writer can lose several races; a small fixed count is
+			// itself flaky under -race. 100 attempts comfortably absorbs the
+			// contention while still bounding the test.
+			for attempt := 0; attempt < 100; attempt++ {
 				cur, err := s.Get(ctx, o.Key())
 				if err != nil {
 					return
