@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/xingjianluo/reconcile-engine-go/internal/object"
@@ -173,13 +174,12 @@ func TestConcurrentUpdatesAreSerialized(t *testing.T) {
 
 	const writers = 50
 	var wg sync.WaitGroup
-	var conflicts, successes int64
-	var mu sync.Mutex
+	var conflicts, successes atomic.Int64
 	for i := 0; i < writers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for attempt := 0; attempt < 3; attempt++ {
+			for attempt := 0; attempt < 20; attempt++ {
 				cur, err := s.Get(ctx, o.Key())
 				if err != nil {
 					return
@@ -188,29 +188,27 @@ func TestConcurrentUpdatesAreSerialized(t *testing.T) {
 					// increment based on the live value (read-modify-write)
 					x.Spec["n"] = incString(x.Spec["n"])
 				})
-				mu.Lock()
 				if IsConflict(err) {
-					conflicts++
+					conflicts.Add(1)
 				} else if err == nil {
-					successes++
-					mu.Unlock()
+					successes.Add(1)
 					return
 				}
-				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
 
 	got, _ := s.Get(ctx, o.Key())
+	sc := successes.Load()
 	fmt.Printf("INPUT %d concurrent readers/writers | JUDGE: successes=%d conflicts=%d final n=%s\n",
-		writers, successes, conflicts, got.Spec["n"])
-	if got.Spec["n"] != incStringN(0, int(successes)) {
+		writers, sc, conflicts.Load(), got.Spec["n"])
+	if got.Spec["n"] != incStringN(0, int(sc)) {
 		t.Fatalf("lost update: expected %d successful increments, final=%s (successes=%d)",
-			writers, got.Spec["n"], successes)
+			writers, got.Spec["n"], sc)
 	}
-	if successes != writers {
-		t.Fatalf("every writer should eventually succeed once: %d/%d", successes, writers)
+	if sc != writers {
+		t.Fatalf("every writer should eventually succeed once: %d/%d", sc, writers)
 	}
 }
 

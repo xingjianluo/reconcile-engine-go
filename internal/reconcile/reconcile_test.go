@@ -198,15 +198,13 @@ func TestCoalescedBurstProcessesLatestVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Rapid updates; every CAS uses the latest read version. Some lose the
-	// race to the reconciler and get conflicts, which is expected.
+	// Rapid updates; each writer retries on CAS conflict so every desired
+	// version (including "20") is definitely committed. The reconciler races
+	// some writes too, exercising the conflict + re-read path.
 	for i := 1; i <= 20; i++ {
-		cur, gerr := r.store.Get(ctx, key)
-		if gerr != nil {
-			t.Fatal(gerr)
-		}
-		_, _ = r.store.Update(ctx, key, cur.ResourceVersion, func(o *object.Object) {
-			o.Spec["rev"] = fmt.Sprintf("%d", i)
+		gen := fmt.Sprintf("%d", i)
+		casUpdate(t, ctx, r.store, key, func(o *object.Object) {
+			o.Spec["rev"] = gen
 		})
 	}
 
@@ -248,27 +246,79 @@ func TestFinalizerDeletionEndToEnd(t *testing.T) {
 		t.Fatal("did not converge before delete")
 	}
 
-	cur, _ := r.store.Get(ctx, key)
-	marked, err := r.store.Delete(ctx, key, cur.ResourceVersion)
+	// Watch events deterministically. The protocol guarantees a
+	// deleting-state upsert (object present with finalizer) is published
+	// BEFORE the physical delete; assert exactly that ordering.
+	events, err := r.store.Watch(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	order := make(chan string, 8)
+	go func() {
+		for ev := range events {
+			if ev.Key != key {
+				continue
+			}
+			switch ev.Type {
+			case store.EventUpsert:
+				if ev.Object.BeingDeleted() {
+					order <- "deleting"
+				}
+			case store.EventDelete:
+				order <- "deleted"
+			}
+		}
+	}()
+
+	// Mark for deletion with CAS retry: a late reconcile against the same
+	// converged object may advance the version right before this call.
+	var marked *object.Object
+	if !waitFor(2*time.Second, func() bool {
+		cur, gerr := r.store.Get(ctx, key)
+		if gerr != nil {
+			return false
+		}
+		var derr error
+		marked, derr = r.store.Delete(ctx, key, cur.ResourceVersion)
+		return derr == nil
+	}) {
+		t.Fatal("could not mark object for deletion")
+	}
 	fmt.Printf("INPUT Delete rv=%d | JUDGE: object remains deleting=%t finalizers=%v\n",
-		cur.ResourceVersion, marked.BeingDeleted(), marked.Finalizers)
+		marked.ResourceVersion, marked.BeingDeleted(), marked.Finalizers)
 
-	// It must not disappear immediately.
-	if _, err := r.store.Get(ctx, key); err != nil {
-		t.Fatalf("object vanished before finalizer cleared: %v", err)
+	// Event ordering proves the finalizer phase was observable and the object
+	// did not vanish immediately. Finalizer cleanup emits extra deleting-state
+	// upserts; only the first deleting event and eventual delete matter.
+	sawDeleting := false
+	deadline := time.After(2 * time.Second)
+	for !sawDeleting {
+		select {
+		case ev := <-order:
+			if ev == "deleting" {
+				sawDeleting = true
+			}
+		case <-deadline:
+			t.Fatal("no deleting-phase event observed")
+		}
 	}
+	deadline = time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-order:
+			if ev == "deleted" {
+				goto removed
+			}
+		case <-deadline:
+			t.Fatal("physical delete event never observed")
+		}
+	}
+removed:
 
-	gone := waitFor(2*time.Second, func() bool {
-		_, err := r.store.Get(ctx, key)
-		return errors.Is(err, object.ErrNotFound)
-	})
-	fmt.Printf("JUDGE: object physically removed after finalizer sequence=%v\n", gone)
-	if !gone {
-		t.Fatal("object was not removed after finalizer cleared")
+	if _, err := r.store.Get(ctx, key); !errors.Is(err, object.ErrNotFound) {
+		t.Fatalf("object should be gone after delete event, err=%v", err)
 	}
+	fmt.Printf("JUDGE: event order deleting -> deleted; finalizer sequence enforced\n")
 }
 
 // TestBackoffRetryThenTerminal drives a reconciler that always fails and

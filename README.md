@@ -11,15 +11,22 @@
 - 删除遵循**终结器（Finalizer）语义**：所有终结器移除后对象才真正消失。
 - 失败任务**限流 + 单调退避**重入队；队列**有界不丢**；关闭时在途调谐
   **可观察并优雅收敛**。
+- 资源间可声明**依赖关系（DependsOn）**：依赖未就绪时**安静等待**（不判失败、
+  不绕过）；依赖变更/删除会**向下传播**自动重新调谐。
+- 删除遵循**依赖顺序**：被依赖的资源在依赖方清理完成之前不会被真正删除。
+- 依赖**缺失**与**成环**给出**可区分、可观察的终结结论**，不卡死、不无限重试、
+  不悄悄消失；修复后由变更传播自动恢复。
 
 ## 目录结构
 
 ```
-internal/object    版本化资源对象、终结器辅助、删除时间戳、深拷贝
+internal/object    版本化资源对象、终结器辅助、删除时间戳、深拷贝、DependsOn 声明
 internal/store     内存版本存储（CAS/乐观锁）、事件 Watch、读穿缓存（陈旧识别）
 internal/queue     去重/按 key 串行/有界/退避工作队列 + 单调退避策略
-internal/reconcile 控制器：事件分发、工作循环、冲突处理、终结器删除、优雅关闭
-cmd/demo           端到端演示：创建→连续更新（合并/冲突）→失败重试→终结器删除
+internal/reconcile 控制器：事件分发、依赖门控/传播/环检测、工作循环、冲突处理、
+                   终结器与依赖顺序删除、Watch 断线重连+resync、优雅关闭
+cmd/demo           端到端演示：收敛→更新合并→依赖编排（等待/传播/缺失/成环/
+                   顺序删除）→失败重试→终结器删除
 ```
 
 ## 快速验证
@@ -110,6 +117,76 @@ go run ./cmd/demo
 证据：`TestFinalizerDeletionSequence`（存储层）与
 `TestFinalizerDeletionEndToEnd`（控制器端到端）。
 
+## 依赖编排（Dependency Orchestration）
+
+资源通过对象上的 `DependsOn []string`（元素为 `MakeKey(namespace,name)` 形式
+的 key）声明依赖。控制器在**调用应用调谐器之前**做依赖门控，因此资源在依赖
+未就绪时不可能先把动作做出去。
+
+### 就绪（Ready）怎么判定
+
+判定顺序（见 `evaluateDeps`）：
+
+1. **成环检测优先**：从该对象沿 `DependsOn` 边做 DFS（颜色标记），若能到达
+   任意环（含自依赖 `A -> A`），立即终结失败 `ReasonDependencyCycle`，错误为
+   `*DependencyCycleError`（携带环路径，如 `a -> b -> a`）。成环检测先于就绪
+   判断，否则自依赖会被当成"还没就绪"而永远等下去。
+2. **依赖存在性**：逐个 `Get` 依赖 key；不存在 → 终结失败
+   `ReasonDependencyMissing`（`*DependencyMissingError`，携带缺失的 key）。
+3. **就绪性**：依赖存在且**未处于删除中**，并且满足 `Config.Ready`：
+   - 默认规则 `DefaultReady`：`Status` 与 `Spec` 完全一致（即已收敛）；
+   - 应用可通过 `Config.Ready func(*object.Object) bool` 自定义就绪条件
+     （例如只要求关键字段被观察到）。
+4. 全部就绪后才调用一次 `Reconcile`。
+
+依赖存在但还没就绪时，控制器用 `RequeueWith(Config.DepWait)` **安静等待**：
+不计失败尝试次数、不产生失败结论、队列中仍只占一个 key 的槽位（有界）。
+
+### 依赖变化如何传播
+
+- 每个 store 事件（Upsert/Delete）除了入队自身，还会触发一次
+  `enqueueDependents`：扫描当前 store 中所有 `DependsOn` 包含该 key 的对象并
+  入队。依赖集合**直接从 store 现场扫描**而不是维护增量索引，因此传播集合与
+  实时状态永远一致，不受事件乱序影响。
+- 传播是**逐层自动发生**的：依赖收敛后自身状态变化产生事件 → 唤醒直接依赖方
+  → 依赖方收敛后再唤醒下一层，最终叶子也会拿到最新输入。
+- 同一轮对同一资源的多次触发仍然在队列里**合并、按序、幂等**处理；处理期间
+  到达的新事件只置脏标记，不产生重复副作用，也不会丢掉最新版本。
+- 终结失败的 key 不是"死信"：缺失依赖后来被创建、或环被编辑打破，相关变更
+  事件会重新入队该 key（队列会复活失败 key），成功收敛后旧结论自动清除。
+
+### 删除的顺序规则
+
+除既有终结器阶段外，控制器对**删除中**的对象额外做反向依赖门控：
+
+- 对象带 `DeletionTimestamp` 时，先扫描是否还有现存对象依赖它
+  （`liveDependents`，同样现场扫 store）；
+- **只要还有任何依赖方存在（即使依赖方自己也在删除中），就不调用应用的清理
+  逻辑**，只安静地按 `DepWait` 重新检查；
+- 依赖方全部物理消失后，被依赖对象才进入终结器清理并真正删除。
+- 因此多个对象按逆拓扑顺序删除时，物理删除事件的顺序保证是"依赖方先、被依赖
+  方后"（`TestOrderedDeletionWaitsForDependents` 用事件顺序断言这一点）。
+- 若一个无终结器的对象被直接物理删除而仍有依赖方引用它，依赖方会在传播触发
+  后得到 `DependencyMissing` 的终结结论，而不是卡死。
+
+### 异常结论对照
+
+| 情况 | 行为 | 原因 / 错误类型 | 恢复方式 |
+| --- | --- | --- | --- |
+| 依赖存在但未就绪 | 安静等待，周期重检 | 无（不是失败，不计数） | 依赖就绪事件传播唤醒 |
+| 依赖处于删除中 | 安静等待 | 无 | 依赖被删（→缺失结论）或恢复 |
+| 依赖 key 不存在 | 立即终结，不重试 | `DependencyMissing` / `*DependencyMissingError` | 依赖被创建后事件传播复活 |
+| 依赖图含环（含自环） | 立即终结，不重试 | `DependencyCycle` / `*DependencyCycleError`（带路径） | 编辑打破环后事件传播复活 |
+| 删除时仍被依赖 | 阻塞删除、安静等待 | 无 | 依赖方先清理完毕 |
+
+### 有界性与可靠性
+
+- 等待中的对象只占用队列中**每 key 一个**条目；突发传播通过合并折叠，内存
+  仍受队列 `Capacity` 约束，饱和时阻塞反压而不是丢弃。
+- store 的 Watch 在订阅方跟不上时会断开（store 自身内存有界）；控制器事件泵
+  会**重新订阅并全量 relist**（先订阅后 list，中间不丢事件，重复触发会被队列
+  合并），因此高并发突发下不会因为一次 Watch 断线永久漏事件。
+
 ## 关闭语义（Graceful Shutdown）
 
 取消运行上下文后：停止事件摄入 → 队列标记关闭并**排空在途/就绪任务** →
@@ -128,6 +205,27 @@ worker 退出。期间进行中的调谐数量可通过 `Controller.InFlight()` 
 | 终结器分阶段删除 | `TestFinalizerDeletionSequence`、`TestFinalizerDeletionEndToEnd` |
 | 单调退避 + 耗尽可区分失败 | `TestMonotonicBackoff`、`TestRetryExhaustionIsDistinguishable`、`TestBackoffRetryThenTerminal` |
 | 有界不丢、在途可见、优雅关闭 | `TestBoundedCapacityDoesNotDrop`、`TestInFlightVisibility`、`TestGracefulShutdownObservesInFlight` |
+| 依赖未就绪时安静等待、就绪后自动继续 | `TestDependencyWaitsThenProceeds` |
+| 依赖变更向下传播（含多级传递）、幂等合并且无陈旧动作 | `TestDependencyChangePropagates`、`TestPropagationIsTransitive` |
+| 按依赖顺序删除（依赖方先删、被依赖方后删） | `TestOrderedDeletionWaitsForDependents` |
+| 删除等待期间高并发突发仍有界、最终清理完成 | `TestDeletionQueueStaysBoundedWhileWaiting` |
+| 依赖缺失：可区分终结失败、不无限重试、出现后自动恢复 | `TestMissingDependencyIsTerminal` |
+| 依赖成环（含自环）：可区分终结失败、修复后自动恢复 | `TestDependencyCycleIsTerminal`、`TestSelfDependencyIsCycle` |
+| 高并发 + 依赖等待下的整体收敛/回退/有界 | `TestDependencyStressUnderConcurrency` |
+| 依赖判定单元测试（环/缺失/就绪/删除中/反向扫描） | `TestFindCycle`、`TestEvaluateDeps`、`TestLiveDependents`、`TestDefaultReady` |
+
+### 本地验证依赖编排
+
+```bash
+# 全部用例，带竞态检测；连续多轮验证稳定性（不依赖外部服务/凭据/时序运气）
+go test -race -count=50 ./...
+
+# 只跑依赖编排相关用例（-v 查看每步 INPUT/JUDGE）
+go test -race -count=10 -v -run 'Dependency|Propagation|OrderedDeletion' ./internal/reconcile/
+
+# 端到端演示：等待 -> 缺失/成环结论 -> 就绪继续 -> 变更传播 -> 顺序删除
+go run ./cmd/demo
+```
 
 ## 设计取舍
 
@@ -135,3 +233,7 @@ worker 退出。期间进行中的调谐数量可通过 `Controller.InFlight()` 
   足够模拟 API Server 语义；生产可替换为分片/持久化实现（仍满足 `Store` 接口）。
 - Watch 订阅带小缓冲；慢消费者会被断开（需 resync），以保证内存有界、写入不被阻塞。
 - 队列的退避时钟可注入（`Config.Clock`），使退避测试完全确定、无需真实 sleep。
+- 依赖边的来源只有对象自身的 `DependsOn`：就绪/成环判定沿 store 实时读取，
+  反向依赖（传播集合、删除门控）现场 `List` 扫描，不维护第二份可变索引，从根上
+  避免"索引与真相不一致"导致的漏唤醒或误放行；本地内存存储下代价可忽略。
+  高并发突发期间的漏事件由"Watch 断线重连 + 全量 relist"兜底。

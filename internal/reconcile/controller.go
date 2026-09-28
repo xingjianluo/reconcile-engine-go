@@ -20,6 +20,14 @@ type Config struct {
 	Workers       int
 	ShutdownGrace time.Duration
 	Logger        func(format string, args ...any)
+
+	// Ready decides when a dependency counts as ready. Defaults to
+	// DefaultReady (Status deep-equals Spec, not being deleted).
+	Ready ReadyFunc
+	// DepWait is the quiet re-check interval while dependencies are not yet
+	// ready or while a deleting object still has dependents. These waits do
+	// NOT count as failed attempts.
+	DepWait time.Duration
 }
 
 // Controller distributes store events to the queue and runs workers that
@@ -43,6 +51,12 @@ func New(cfg Config) *Controller {
 	if cfg.Logger == nil {
 		cfg.Logger = func(string, ...any) {}
 	}
+	if cfg.Ready == nil {
+		cfg.Ready = DefaultReady
+	}
+	if cfg.DepWait <= 0 {
+		cfg.DepWait = 25 * time.Millisecond
+	}
 	return &Controller{cfg: cfg, failures: make(map[string]error)}
 }
 
@@ -55,29 +69,18 @@ func (c *Controller) log(format string, args ...any) {
 // On cancellation it stops pulling new events, lets the queue drain its
 // ready work and tracks in-flight reconciles so they remain observable.
 func (c *Controller) Run(ctx context.Context) error {
-	watchCtx, cancelWatch := context.WithCancel(context.Background())
-	defer cancelWatch()
-
-	events, err := c.cfg.Store.Watch(watchCtx)
-	if err != nil {
-		return err
-	}
-
 	var wg sync.WaitGroup
 
-	// Event pump: store -> queue.
+	// Event pump: store -> queue. The watch may be disconnected by the store
+	// when the subscriber falls behind; runPump re-subscribes and resyncs.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		c.pump(ctx, events)
+		c.runPump(ctx)
 	}()
 
-	// Initial list so objects created before Run are still reconciled.
-	if objs, lerr := c.cfg.Store.List(ctx); lerr == nil {
-		for _, o := range objs {
-			c.enqueueObject(o)
-		}
-	}
+	// The event pump performs the initial relist (see runPump), subscribing
+	// first so objects created at startup cannot be missed.
 
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	for i := 0; i < c.cfg.Workers; i++ {
@@ -90,7 +93,6 @@ func (c *Controller) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	c.log("shutdown signal received; stopping event intake")
-	cancelWatch()
 
 	// Bound the drain: the queue waits for tracked keys while in-flight
 	// reconciles remain observable via InFlight, then workers are stopped.
@@ -107,9 +109,38 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
+// runPump maintains the store->queue event stream. The store disconnects a
+// watcher that cannot keep up (to bound its own memory); on disconnect the
+// pump immediately re-subscribes and performs a full relist+re-enqueue. The
+// subscription is created BEFORE the relist, so no change between them is
+// missed; duplicates merely merge inside the coalescing queue.
+func (c *Controller) runPump(ctx context.Context) {
+	for ctx.Err() == nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		events, err := c.cfg.Store.Watch(watchCtx)
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		// Backfill everything: enqueues merge with already-seen keys.
+		if objs, lerr := c.cfg.Store.List(ctx); lerr == nil {
+			for _, o := range objs {
+				c.enqueueObject(o)
+			}
+		}
+		c.pump(ctx, events)
+		cancel()
+	}
+}
+
 // pump forwards store events into the coalescing queue. Delete events carry
 // no object; the key is still enqueued so a final reconcile can observe the
 // tombstone/absence. Stale (older-version) events are dropped by the queue.
+// It returns when ctx is cancelled or the event channel closes (watch drop).
 func (c *Controller) pump(ctx context.Context, events <-chan store.Event) {
 	for {
 		select {
@@ -125,6 +156,10 @@ func (c *Controller) pump(ctx context.Context, events <-chan store.Event) {
 			case store.EventDelete:
 				c.cfg.Queue.Add(ev.Key, queue.EnqueueOptions{})
 			}
+			// Propagation: anything depending on the changed key must
+			// re-evaluate. Repeated triggers for the same key still merge
+			// inside the queue, so bursts cost one slot per dependent.
+			c.enqueueDependents(ctx, ev.Key)
 		}
 	}
 }
@@ -138,6 +173,19 @@ func (c *Controller) enqueueObject(o *object.Object) {
 		ResourceVersion: o.ResourceVersion,
 		HasVersion:      true,
 	})
+}
+
+// enqueueDependents re-triggers every existing object that depends on key.
+// Dependents are derived from the store rather than an incremental index so
+// the propagation set can never disagree with live state.
+func (c *Controller) enqueueDependents(ctx context.Context, key string) {
+	deps, err := liveDependents(ctx, c.cfg.Store, key)
+	if err != nil {
+		return
+	}
+	for _, d := range deps {
+		c.cfg.Queue.Add(d, queue.EnqueueOptions{})
+	}
 }
 
 // worker pulls ready keys and reconciles them until the queue shuts down.
@@ -164,12 +212,50 @@ func (c *Controller) processKey(ctx context.Context, id int, key string) {
 		if errors.Is(err, object.ErrNotFound) {
 			// Object already gone (e.g. final finalize observed delete).
 			c.log("worker %d: key %s absent -> done", id, key)
+			c.clearFailure(key)
 			c.cfg.Queue.Done(key)
 			return
 		}
 		c.fail(key, ReasonReconcileError, 0, err)
 		c.cfg.Queue.Fail(key, err)
 		return
+	}
+
+	// Dependency gating happens BEFORE any app action, so a resource whose
+	// dependencies are not ready can never perform work out of order.
+	if obj.BeingDeleted() {
+		// Ordered deletion: a deleting object survives until every dependent
+		// has been cleaned up.
+		deps, derr := liveDependents(ctx, c.cfg.Store, key)
+		if derr != nil {
+			c.fail(key, ReasonReconcileError, 0, derr)
+			c.cfg.Queue.Fail(key, derr)
+			return
+		}
+		if len(deps) > 0 {
+			c.log("worker %d: %s deleting but still depended on by %v -> wait", id, key, deps)
+			c.cfg.Queue.RequeueWith(key, c.cfg.DepWait)
+			return
+		}
+	} else {
+		verdict, verr := evaluateDeps(ctx, c.cfg.Store, obj, c.cfg.Ready)
+		switch verdict {
+		case depWait:
+			c.log("worker %d: %s waiting for dependencies to be ready", id, key)
+			// Quiet wait: not a failed attempt, no failure conclusion.
+			c.cfg.Queue.RequeueWith(key, c.cfg.DepWait)
+			return
+		case depMissing:
+			c.log("worker %d: %s blocked: %v", id, key, verr)
+			c.fail(key, ReasonDependencyMissing, 0, verr)
+			c.cfg.Queue.Fail(key, verr)
+			return
+		case depCycle:
+			c.log("worker %d: %s blocked: %v", id, key, verr)
+			c.fail(key, ReasonDependencyCycle, 0, verr)
+			c.cfg.Queue.Fail(key, verr)
+			return
+		}
 	}
 
 	c.log("worker %d: reconciling %s", id, obj.String())
@@ -182,6 +268,9 @@ func (c *Controller) processKey(ctx context.Context, id int, key string) {
 			c.cfg.Queue.RequeueWith(key, 20*time.Millisecond)
 			return
 		}
+		// A successful convergence retires any earlier structural conclusion
+		// (e.g. a missing dependency that was later created).
+		c.clearFailure(key)
 		c.cfg.Queue.Done(key)
 		return
 	}
@@ -214,6 +303,14 @@ func (c *Controller) fail(key string, reason FailureReason, attempts int, err er
 	c.failures[key] = &TerminalFailure{Key: key, Reason: reason, Attempts: attempts, Err: err}
 	c.mu.Unlock()
 	c.log("TERMINAL key=%s reason=%s err=%v", key, reason, err)
+}
+
+// clearFailure retires an earlier terminal conclusion once a key progresses
+// again (e.g. a missing dependency appeared and the dependent converged).
+func (c *Controller) clearFailure(key string) {
+	c.mu.Lock()
+	delete(c.failures, key)
+	c.mu.Unlock()
 }
 
 // InFlight returns the number of reconciles currently executing.

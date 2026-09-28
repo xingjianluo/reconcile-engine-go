@@ -33,6 +33,12 @@ type Object struct {
 	// Finalizers block physical deletion until each is removed.
 	Finalizers []string
 
+	// DependsOn declares the keys (MakeKey format) of resources that must
+	// exist and be ready before this object may be reconciled. The engine
+	// also uses the reverse edge: changes to a dependency re-trigger its
+	// dependents, and a deleting object is blocked while dependents remain.
+	DependsOn []string
+
 	// DeletionTimestamp != 0 marks the object as being deleted.
 	DeletionTimestamp DeletionTimestamp
 }
@@ -52,6 +58,16 @@ func MakeKey(namespace, name string) string {
 
 // BeingDeleted reports whether a deletion has been requested.
 func (o *Object) BeingDeleted() bool { return o.DeletionTimestamp != 0 }
+
+// DependsOnKey reports whether key is declared as a dependency.
+func (o *Object) DependsOnKey(key string) bool {
+	for _, d := range o.DependsOn {
+		if d == key {
+			return true
+		}
+	}
+	return false
+}
 
 // HasFinalizer reports whether f is present.
 func (o *Object) HasFinalizer(f string) bool {
@@ -107,6 +123,11 @@ func (o *Object) Clone() *Object {
 		cp.Finalizers = append([]string(nil), o.Finalizers...)
 	} else {
 		cp.Finalizers = nil
+	}
+	if o.DependsOn != nil {
+		cp.DependsOn = append([]string(nil), o.DependsOn...)
+	} else {
+		cp.DependsOn = nil
 	}
 	return &cp
 }

@@ -26,6 +26,10 @@ const (
 	ReasonRetryExhausted FailureReason = "RetryExhausted"
 	// ReasonConflictLoop means the object kept changing under us.
 	ReasonConflictLoop FailureReason = "ConflictLoop"
+	// ReasonDependencyMissing means a declared dependency does not exist.
+	ReasonDependencyMissing FailureReason = "DependencyMissing"
+	// ReasonDependencyCycle means the dependency graph contains a cycle.
+	ReasonDependencyCycle FailureReason = "DependencyCycle"
 )
 
 // TerminalFailure records the distinguishable outcome of an exhausted key.
