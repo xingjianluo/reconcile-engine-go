@@ -11,9 +11,10 @@
 - 删除遵循**终结器（Finalizer）语义**：所有终结器移除后对象才真正消失。
 - 失败任务**限流 + 单调退避**重入队；队列**有界不丢**；关闭时在途调谐
   **可观察并优雅收敛**。
-- **资源依赖编排**：依赖未就绪时安静等待；依赖变化自动向下传播；删除按
-  **依赖逆序**进行；**引用缺失 / 成环**给出可区分、可观察、不卡死的结论；
-  高并发与依赖等待下队列与内存**有界**。
+- **资源依赖编排**：依赖未就绪时安静等待；依赖变化自动向下传播；删除严格按
+  **依赖逆序**进行——只要依赖方还物理存在（即使它自己也在删除中），被依赖资源就
+  必须保留为可观察的"删除中"，等依赖方全部真正消失后自动级联删除；**引用缺失 /
+  成环**给出可区分、可观察、不卡死的结论；高并发与依赖等待下队列与内存**有界**。
 
 ## 目录结构
 
@@ -41,6 +42,13 @@ go run ./cmd/demo
 
 测试输出中每一步都带有 `INPUT ... | JUDGE: ...`，明确给出输入条件与判定依据。
 重复运行结果一致（`go test -count=N ./...`）。
+
+只验证删除顺序相关行为可运行：
+
+```bash
+# 链式 / 扇入 / 删除中仍阻塞，三个用例都通过 watch 记录真实物理删除事件并断言先后
+go test -race -count=50 -run 'TestDeletionOrder|TestDeletingDependent|TestReverseOrderDeletion|TestChainReverseDeletion' ./internal/reconcile/
+```
 
 ## 调谐协议（Reconciliation Protocol）
 
@@ -149,18 +157,33 @@ go run ./cmd/demo
 ### 删除顺序规则（逆序）
 
 引擎用一个**引擎自管的守护终结器** `reconcile.GuardFinalizer` 强制逆序删除，
-应用调谐器无需感知它：
+应用调谐器无需感知它。核心判定以**权威存储**为准（不是派生的反向索引），
+判定的是依赖方是否**物理存在**，而不是"是否已经收到删除请求"：
 
 1. 一个**存活且当前有依赖方**的对象，在其依赖已就绪后会被自动加上守护终结器
    （存活期单调：至多添加一次，不做增删抖动，因此不会产生重复副作用）。
-2. 删除一个仍被依赖的对象时，只要它还有存活的依赖方，它就被**保留为删除中**、
-   守护终结器不摘除，物理删除被阻塞——依赖方不清完，它不能真正消失。
-3. 依赖方陆续删除、图中不再有依赖方后，引擎摘除守护终结器；随后应用终结器完成
-   清理、对象才物理删除。链式依赖因此按 **叶子 → … → 根** 的逆序消失。
-4. 极端情况下若对象在守护终结器加上之前就被请求删除（无终结器会立即消失），
+2. 删除一个仍被依赖的对象时，**只要有任何一个依赖它的对象还在存储里，它就被
+   保留为删除中**、守护终结器不摘除，物理删除被阻塞。这里"还在"按物理存在判断：
+   依赖方哪怕自己已经被打上 `DeletionTimestamp`、正在慢慢清理，也仍然算"没删完"，
+   照样阻塞；只有依赖方**真正物理消失**（删除事件到达并触发被依赖方重新入队）后
+   才放行。重复提交同一个删除请求（CAS 幂等）同样不会提前放行。
+3. 依赖方全部物理消失后，引擎在**下一次调谐（由依赖方的删除事件自动触发，无需人工
+   再删一次）**摘除守护终结器；随后应用终结器完成清理、对象才物理删除。链式依赖因此
+   严格按 **叶子 → … → 根** 的逆序消失；扇入场景下共享资源一定最后消失。
+4. 依赖方迟迟删不完（例如应用终结器清理很慢）时，被依赖资源会**一直保留且状态可观察**
+   （仍可 Get，`DeletionTimestamp` 已置、守护终结器仍在），不会悄悄消失，也不会在
+   "保留/放行"之间来回抖动——等待走 scheduled 安静重排队，不计失败次数。
+5. 多个删除请求并发提交、多个 worker 同时处理时上述顺序仍然成立：放行判定读的是存储
+   全量快照，而存储用单一互斥锁把"读"与"物理删除"串成全序，任何一个依赖方在物理
+   删除提交之前都必然对该判定可见。
+6. 极端情况下若对象在守护终结器加上之前就被请求删除（无终结器会立即消失），
    依赖方下一轮会观测到「依赖缺失」的明确结论（见下），同样不会状态错乱或卡死。
 
-证据：`TestReverseOrderDeletion`、`TestChainReverseDeletion`。
+证据（直接断言真实物理删除事件的先后，而非只断言最终都消失）：
+`TestDeletionOrderChainPhysical`（三层链并发删除 + 重复请求）、
+`TestDeletionOrderFanInPhysical`（一个资源被多个资源依赖，共享资源必须最后消失）、
+`TestDeletingDependentStillBlocksParent`（依赖方删除中仍阻塞 + 重复请求不放行 +
+放行后自动级联）、`TestReverseOrderDeletion`、`TestChainReverseDeletion`。
 
 ### 依赖缺失与成环：可区分、可观察、不卡死
 
@@ -216,7 +239,7 @@ worker 退出。期间进行中的调谐数量可通过 `Controller.InFlight()` 
 | 依赖未就绪安静等待、就绪后自动继续 | `TestDependencyWaitThenProceed` |
 | 调谐按依赖顺序、守护终结器就位 | `TestReconcileOrderFollowsDependencies` |
 | 依赖变化向下传播、结果一致、幂等 | `TestDependencyChangePropagatesDownstream`、`TestCoalescedDependencyTriggers` |
-| 删除按依赖逆序（单级 / 链式） | `TestReverseOrderDeletion`、`TestChainReverseDeletion` |
+| 删除按依赖逆序（单级 / 链式）；依赖方删除中仍阻塞；共享资源最后消失；重复删除请求不提前放行 | `TestReverseOrderDeletion`、`TestChainReverseDeletion`、`TestDeletionOrderChainPhysical`、`TestDeletionOrderFanInPhysical`、`TestDeletingDependentStillBlocksParent` |
 | 依赖缺失：可区分失败 + 创建后自动恢复 | `TestMissingDependencyTerminalThenResolved` |
 | 依赖成环：可区分失败 + 拆边后恢复 | `TestDependencyCycleTerminalThenBroken` |
 | 高并发 + 依赖等待下有界不堆积、不饥饿 | `TestBoundedUnderDependencyLoad` |
@@ -240,5 +263,9 @@ go test -race -count=10 ./...
   引擎只负责按图门控、传播与删除排序。
 - 守护终结器在存活期单调（只加一次）、仅在删除路径摘除，避免「有/无依赖方」抖动
   引发的反复写入与传播风暴。
+- 删除放行判定看依赖方是否**物理存在**（含已标记删除、仍在清理的依赖方），而不是
+  看删除标记；判定直接扫权威存储而非只看派生的反向索引，因此事件处理的瞬时缝隙、
+  并发删除请求与多 worker 都不会让被依赖资源提前消失。放行等待走 scheduled 安静
+  重排队，依赖方物理消失的删除事件会把被依赖方自动重新唤醒，不轮询、不卡死。
 - 安静等待（依赖未就绪）与退避重试都放入 scheduled 集合、不计失败次数、不占工作槽，
   使「等待」既不被误判为失败，也不会饿死就绪工作。

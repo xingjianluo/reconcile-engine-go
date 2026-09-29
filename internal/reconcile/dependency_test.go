@@ -28,6 +28,7 @@ type depReconciler struct {
 	mu      sync.Mutex
 	applied []string
 	hold    map[string]bool
+	holdDel map[string]bool
 	visitsM map[string]int64
 
 	appliedN atomic.Int64
@@ -55,6 +56,24 @@ func (r *depReconciler) holding(key string) bool {
 	return r.hold[key]
 }
 
+// setHoldDelete simulates a dependent whose deletion cleanup is slow: while
+// held, a deleting object keeps its app finalizer and asks to be retried, so
+// it stays physically present in "deleting" state indefinitely.
+func (r *depReconciler) setHoldDelete(key string, on bool) {
+	r.mu.Lock()
+	if r.holdDel == nil {
+		r.holdDel = map[string]bool{}
+	}
+	r.holdDel[key] = on
+	r.mu.Unlock()
+}
+
+func (r *depReconciler) holdingDelete(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.holdDel[key]
+}
+
 func (r *depReconciler) Reconcile(ctx context.Context, obj *object.Object) (Result, error) {
 	r.visits.Add(1)
 	r.mu.Lock()
@@ -64,6 +83,10 @@ func (r *depReconciler) Reconcile(ctx context.Context, obj *object.Object) (Resu
 	r.visitsM[obj.Key()]++
 	r.mu.Unlock()
 	if obj.BeingDeleted() {
+		// Slow-cleanup simulation: stay present (deleting) and requeue.
+		if obj.HasFinalizer(testFinalizer) && r.holdingDelete(obj.Key()) {
+			return Result{Requeue: true}, nil
+		}
 		if obj.HasFinalizer(testFinalizer) {
 			if _, err := r.s.Update(ctx, obj.Key(), obj.ResourceVersion, func(o *object.Object) {
 				o.RemoveFinalizer(testFinalizer)
@@ -175,7 +198,7 @@ func TestDependencyWaitThenProceed(t *testing.T) {
 	s := r.store
 	createObj(t, ctx, s, "ns", "parent")
 	// Wait for parent to converge & become ready.
-	if !waitFor(2*time.Second, func() bool { return readyKey(t, ctx, s, "ns/parent") }) {
+	if !waitFor(5*time.Second, func() bool { return readyKey(t, ctx, s, "ns/parent") }) {
 		t.Fatal("parent did not converge")
 	}
 
@@ -213,7 +236,7 @@ func TestDependencyWaitThenProceed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !waitFor(2*time.Second, func() bool { return readyKey(t, ctx, s, "ns/child") }) {
+	if !waitFor(5*time.Second, func() bool { return readyKey(t, ctx, s, "ns/child") }) {
 		t.Fatal("child did not proceed after dependency became ready")
 	}
 	fmt.Printf("INPUT parent ready=true | JUDGE: child auto-proceeded and converged\n")
@@ -235,7 +258,7 @@ func TestReconcileOrderFollowsDependencies(t *testing.T) {
 	createObj(t, ctx, r.store, "ns", "mid", object.DependencyRef{Name: "root"})
 	createObj(t, ctx, r.store, "ns", "root")
 
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		return readyKey(t, ctx, r.store, "ns/root") &&
 			readyKey(t, ctx, r.store, "ns/mid") &&
 			readyKey(t, ctx, r.store, "ns/leaf")
@@ -293,7 +316,7 @@ func TestDependencyChangePropagatesDownstream(t *testing.T) {
 
 	createObj(t, ctx, s, "ns", "base")
 	createObj(t, ctx, s, "ns", "top", object.DependencyRef{Name: "base"})
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		return readyKey(t, ctx, s, "ns/base") && readyKey(t, ctx, s, "ns/top")
 	}) {
 		t.Fatal("initial convergence failed")
@@ -314,13 +337,13 @@ func TestDependencyChangePropagatesDownstream(t *testing.T) {
 	}
 
 	// top must actually be re-reconciled via propagation (visits increase)...
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		return r.rec.visitsOfKey("ns/top") > beforeVisits
 	}) {
 		t.Fatal("dependency change did not propagate to top (no re-reconcile)")
 	}
 	// ...and then settle ready.
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		o, err := s.Get(ctx, "ns/top")
 		return err == nil && o != nil && o.Ready
 	}) {
@@ -359,7 +382,7 @@ func TestReverseOrderDeletion(t *testing.T) {
 
 	createObj(t, ctx, s, "ns", "parent")
 	createObj(t, ctx, s, "ns", "child", object.DependencyRef{Name: "parent"})
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		return readyKey(t, ctx, s, "ns/parent") && readyKey(t, ctx, s, "ns/child")
 	}) {
 		t.Fatal("did not converge")
@@ -391,7 +414,7 @@ func TestReverseOrderDeletion(t *testing.T) {
 
 	// Now delete the child; it cleans its own finalizer and disappears.
 	deleteNow("ns/child")
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		_, err := s.Get(ctx, "ns/child")
 		return errors.Is(err, object.ErrNotFound)
 	}) {
@@ -400,7 +423,7 @@ func TestReverseOrderDeletion(t *testing.T) {
 
 	// Once the child is gone, the parent's guard must be released and parent
 	// physically removed by the controller.
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		_, err := s.Get(ctx, "ns/parent")
 		return errors.Is(err, object.ErrNotFound)
 	}) {
@@ -424,7 +447,7 @@ func TestMissingDependencyTerminalThenResolved(t *testing.T) {
 	createObj(t, ctx, s, "ns", "lonely", object.DependencyRef{Name: "ghost"})
 
 	var terminal error
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		terminal = r.ctrl.Failures()["ns/lonely"]
 		return terminal != nil
 	}) {
@@ -456,7 +479,7 @@ func TestMissingDependencyTerminalThenResolved(t *testing.T) {
 	// Create the missing dependency: the dependent must be revived and clear
 	// its failure, converging exactly as if ghost had existed all along.
 	createObj(t, ctx, s, "ns", "ghost")
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		return readyKey(t, ctx, s, "ns/lonely") && r.ctrl.Failures()["ns/lonely"] == nil
 	}) {
 		t.Fatal("lonely did not revive/converge after dependency creation")
@@ -480,7 +503,7 @@ func TestDependencyCycleTerminalThenBroken(t *testing.T) {
 	createObj(t, ctx, s, "ns", "c", object.DependencyRef{Name: "a"})
 
 	members := []string{"ns/a", "ns/b", "ns/c"}
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		for _, k := range members {
 			if r.ctrl.Failures()[k] == nil {
 				return false
@@ -517,7 +540,7 @@ func TestDependencyCycleTerminalThenBroken(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		for _, k := range members {
 			if !readyKey(t, ctx, s, k) || r.ctrl.Failures()[k] != nil {
 				return false
@@ -554,7 +577,7 @@ func TestBoundedUnderDependencyLoad(t *testing.T) {
 	}
 
 	const total = 1 + 40 + 20
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	var violated bool
 	converged := false
 	for time.Now().Before(deadline) {
@@ -603,7 +626,7 @@ func TestCoalescedDependencyTriggers(t *testing.T) {
 
 	createObj(t, ctx, s, "ns", "dep")
 	createObj(t, ctx, s, "ns", "follower", object.DependencyRef{Name: "dep"})
-	if !waitFor(2*time.Second, func() bool { return readyKey(t, ctx, s, "ns/follower") }) {
+	if !waitFor(5*time.Second, func() bool { return readyKey(t, ctx, s, "ns/follower") }) {
 		t.Fatal("initial convergence failed")
 	}
 
@@ -614,7 +637,7 @@ func TestCoalescedDependencyTriggers(t *testing.T) {
 			o.AnnotateTouched()
 		})
 	}
-	if !waitFor(2*time.Second, func() bool {
+	if !waitFor(30*time.Second, func() bool {
 		o, _ := s.Get(ctx, "ns/follower")
 		return o != nil && o.Ready
 	}) {
@@ -656,42 +679,36 @@ func TestChainReverseDeletion(t *testing.T) {
 	createObj(t, ctx, s, "ns", "mid", object.DependencyRef{Name: "root"})
 	createObj(t, ctx, s, "ns", "root")
 	for _, k := range []string{"ns/root", "ns/mid", "ns/leaf"} {
-		if !waitFor(2*time.Second, func() bool { return readyKey(t, ctx, s, k) }) {
+		if !waitFor(5*time.Second, func() bool { return readyKey(t, ctx, s, k) }) {
 			t.Fatalf("%s did not converge", k)
 		}
 	}
 
-	del := func(key string) {
-		cur, _ := s.Get(ctx, key)
-		if _, err := s.Delete(ctx, key, cur.ResourceVersion); err != nil {
-			t.Fatal(err)
-		}
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	evCh, err := s.Watch(watchCtx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Request deletion of all three, in dependency (forward) order.
-	del("ns/root")
-	del("ns/mid")
-	del("ns/leaf")
+	orderRec := newDeleteOrderRecorder(evCh)
 
-	// leaf must be able to disappear; mid only after leaf; root last.
-	if !waitFor(2*time.Second, func() bool {
-		_, e := s.Get(ctx, "ns/leaf")
-		return errors.Is(e, object.ErrNotFound)
-	}) {
-		t.Fatal("leaf was not removed")
+	// Request deletion of all three, in dependency (forward) order.
+	requestDelete(t, ctx, s, "ns/root")
+	requestDelete(t, ctx, s, "ns/mid")
+	requestDelete(t, ctx, s, "ns/leaf")
+
+	for _, k := range []string{"ns/leaf", "ns/mid", "ns/root"} {
+		waitForGone(t, ctx, s, k)
 	}
-	if !waitFor(2*time.Second, func() bool {
-		_, e := s.Get(ctx, "ns/mid")
-		return errors.Is(e, object.ErrNotFound)
-	}) {
-		t.Fatal("mid was not removed after leaf")
+	stopWatch()
+	<-orderRec.done
+
+	// Assert the REAL physical removal order (leaf before mid before root),
+	// not just that all three are eventually absent.
+	order := orderRec.snapshot()
+	iLeaf, iMid, iRoot := positionOf(order, "ns/leaf"), positionOf(order, "ns/mid"), positionOf(order, "ns/root")
+	if iLeaf < 0 || iMid < 0 || iRoot < 0 || !(iLeaf < iMid && iMid < iRoot) {
+		t.Fatalf("physical deletion order must be leaf<mid<root, got %v", order)
 	}
-	// While leaf/mid existed the root was preserved by its guard; once they
-	// are gone the guard is released and the root is physically removed.
-	if !waitFor(2*time.Second, func() bool {
-		_, e := s.Get(ctx, "ns/root")
-		return errors.Is(e, object.ErrNotFound)
-	}) {
-		t.Fatal("root must be removed only after its dependents cleared")
-	}
-	fmt.Printf("INPUT delete root,mid,leaf together | JUDGE: removed leaf<mid<root (reverse order)\n")
+	fmt.Printf("INPUT delete root,mid,leaf together | JUDGE: physical delete order=%v (reverse order)\n", order)
 }

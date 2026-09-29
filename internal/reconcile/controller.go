@@ -389,7 +389,7 @@ func (c *Controller) gateActive(ctx context.Context, id int, obj *object.Object)
 	}
 
 	// 4) All dependencies are ready: ensure the reverse-deletion guard is
-	//    present while live dependents exist. The guard is monotonic during
+	//    present while any dependent still exists. The guard is monotonic during
 	//    the object's lifetime (added at most once; removed only on the
 	//    deletion path), so this can never oscillate or fan out repeatedly.
 	if cont := c.ensureGuardFinalizer(ctx, id, obj); !cont {
@@ -399,7 +399,7 @@ func (c *Controller) gateActive(ctx context.Context, id int, obj *object.Object)
 }
 
 // ensureGuardFinalizer adds the engine guard finalizer exactly once when the
-// object currently has live dependents. It returns false when a guard write
+// object currently has any present dependent. It returns false when a guard write
 // was performed (or conflicted) and the key was re-queued to re-read. It never
 // removes a guard from an alive object: removal happens only during deletion,
 // which keeps the guard monotonic and the system free of add/remove churn.
@@ -423,27 +423,31 @@ func (c *Controller) ensureGuardFinalizer(ctx context.Context, id int, obj *obje
 
 // processDeletion enforces reverse-order deletion. It returns true only when
 // the object is allowed to proceed to the app reconciler (finalizer cleanup
-// and physical removal).
+// and physical removal), which requires that every dependent has physically
+// disappeared — a dependent merely marked for deletion still blocks it.
 func (c *Controller) processDeletion(ctx context.Context, id int, obj *object.Object) bool {
 	key := obj.Key()
 
 	// Deletion safety is decided against the authoritative store, not only the
 	// (derived, briefly-asynchronous) reverse index: an object may be removed
-	// only once no LIVE object still references it. A dependent that is itself
-	// deleting does not block it, so a chain tears down leaf-first.
-	blocked, err := c.hasLiveDependent(ctx, key)
+	// only once every object that declares it as a dependency has PHYSICALLY
+	// disappeared. A dependent that is itself deleting is still present and
+	// still counts, so it must finish its own removal first. This is what makes
+	// a chain tear down strictly leaf-first even when every member's deletion
+	// is requested together and several workers run concurrently.
+	blocked, err := c.hasRemainingDependent(ctx, key)
 	if err != nil {
 		c.log("worker %d: dependent scan failed for deleting %s (%v) -> wait", id, key, err)
 		c.cfg.Queue.RequeueWith(key, c.cfg.DependencyWaitDelay)
 		return false
 	}
 	if blocked {
-		c.log("worker %d: %s deleting but still has a live dependent -> keep guard, wait", id, key)
+		c.log("worker %d: %s deleting but a dependent is still present (possibly deleting) -> keep guard, wait", id, key)
 		c.cfg.Queue.RequeueWith(key, c.cfg.DependencyWaitDelay)
 		return false
 	}
 
-	// No live dependent remains: drop the engine guard first (if present), then
+	// No present dependent remains: drop the engine guard first (if present), then
 	// let the app reconciler perform its own cleanup on a subsequent run.
 	if obj.HasFinalizer(GuardFinalizer) {
 		_, err := c.cfg.Store.Update(ctx, key, obj.ResourceVersion, func(o *object.Object) {
@@ -452,7 +456,7 @@ func (c *Controller) processDeletion(ctx context.Context, id int, obj *object.Ob
 		if err != nil {
 			c.log("worker %d: guard-remove conflict during delete on %s (%v) -> re-read", id, key, err)
 		} else {
-			c.log("worker %d: live dependents cleared, removed guard from deleting %s", id, key)
+			c.log("worker %d: all dependents physically gone, removed guard from deleting %s", id, key)
 		}
 		c.cfg.Queue.RequeueWith(key, immediateRequeueDelay)
 		return false
@@ -460,19 +464,23 @@ func (c *Controller) processDeletion(ctx context.Context, id int, obj *object.Ob
 	return true
 }
 
-// hasLiveDependent reports whether any object currently present in the store
-// declares key as a dependency and is not itself being deleted. A deleting
-// dependent is already tearing down and therefore must not block key's own
-// removal (this is what makes a dependency chain delete leaf-first). This
-// consults the source of truth, avoiding a transient gap in the graph's
-// reverse index during event processing.
-func (c *Controller) hasLiveDependent(ctx context.Context, key string) (bool, error) {
+// hasRemainingDependent reports whether any object currently present in the
+// store declares key as a dependency. Presence — not the deletion flag — is
+// what counts: a dependent marked for deletion is still physically there and
+// may itself be blocked by ITS dependents, so allowing key to leave first
+// could remove a resource whose dependent has not finished cleaning up. Only
+// after a dependent has physically vanished (and its deletion event has
+// propagated, which re-enqueues key) does it stop blocking. This consults the
+// source of truth, avoiding a transient gap in the graph's reverse index
+// during event processing, and is safe under concurrent deletion requests and
+// multiple workers because the store serializes reads and physical removals.
+func (c *Controller) hasRemainingDependent(ctx context.Context, key string) (bool, error) {
 	objs, err := c.cfg.Store.List(ctx)
 	if err != nil {
 		return false, err
 	}
 	for _, o := range objs {
-		if o.Key() == key || o.BeingDeleted() {
+		if o.Key() == key {
 			continue
 		}
 		for _, ref := range dependency.NormalizeRefs(o.Namespace, o.Dependencies) {
