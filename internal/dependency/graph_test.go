@@ -112,9 +112,13 @@ func TestDeletePropagatesToDependentsAndKeepsRefs(t *testing.T) {
 	g.Upsert("ns/a", []string{"ns/dep"}, false, false)
 	g.Upsert("ns/b", []string{"ns/dep"}, false, false)
 
-	deps := g.Delete("ns/dep")
+	deps, upstreams := g.Delete("ns/dep")
 	if len(deps) != 2 || deps[0] != "ns/a" || deps[1] != "ns/b" {
 		t.Fatalf("dependents=%v want [a b]", deps)
+	}
+	// dep declared no dependencies itself.
+	if len(upstreams) != 0 {
+		t.Fatalf("dependencies=%v want empty", upstreams)
 	}
 	// a now observes a missing dependency.
 	missing, _ := g.Blockers("ns/a")
@@ -173,7 +177,11 @@ func TestDeleteDependentCleansReverseIndex(t *testing.T) {
 	g := NewGraph()
 	g.Upsert("ns/dep", nil, true, false)
 	g.Upsert("ns/a", []string{"ns/dep"}, false, false)
-	g.Delete("ns/a")
+	if dependents, dependencies := g.Delete("ns/a"); len(dependents) != 0 ||
+		len(dependencies) != 1 || dependencies[0] != "ns/dep" {
+		t.Fatalf("deleting dependent must clear ref and report its dep; got dependents=%v dependencies=%v",
+			dependents, dependencies)
+	}
 	if got := g.Dependents("ns/dep"); len(got) != 0 {
 		t.Fatalf("deleting dependent must clear ref, got %v", got)
 	}

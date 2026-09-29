@@ -25,7 +25,8 @@ import (
 type depReconciler struct {
 	s store.Store
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// applied records keys whose apply write landed (exactly once per object).
 	applied []string
 	hold    map[string]bool
 	visitsM map[string]int64
@@ -64,6 +65,11 @@ func (r *depReconciler) Reconcile(ctx context.Context, obj *object.Object) (Resu
 	r.visitsM[obj.Key()]++
 	r.mu.Unlock()
 	if obj.BeingDeleted() {
+		// A held dependent simulates slow/stuck cleanup: it stays present and
+		// keeps its finalizer, so objects that depend on it must keep waiting.
+		if r.holding(obj.Key()) && obj.HasFinalizer(testFinalizer) {
+			return Result{}, nil
+		}
 		if obj.HasFinalizer(testFinalizer) {
 			if _, err := r.s.Update(ctx, obj.Key(), obj.ResourceVersion, func(o *object.Object) {
 				o.RemoveFinalizer(testFinalizer)
@@ -90,11 +96,9 @@ func (r *depReconciler) Reconcile(ctx context.Context, obj *object.Object) (Resu
 		return Result{}, nil
 	}
 
-	// Record the order in which distinct objects first run their side effect.
-	r.mu.Lock()
-	r.applied = append(r.applied, obj.Key())
-	r.mu.Unlock()
-
+	// Record the order in which distinct objects first run their side effect,
+	// only once the write actually lands: a conflicted attempt is retried with a
+	// fresh read and must not count, otherwise the apply order would be skewed.
 	_, err := r.s.Update(ctx, obj.Key(), obj.ResourceVersion, func(o *object.Object) {
 		o.AddFinalizer(testFinalizer)
 		o.Status = cloneSpec(o.Spec)
@@ -103,6 +107,9 @@ func (r *depReconciler) Reconcile(ctx context.Context, obj *object.Object) (Resu
 	if err != nil {
 		return Result{}, err
 	}
+	r.mu.Lock()
+	r.applied = append(r.applied, obj.Key())
+	r.mu.Unlock()
 	r.appliedN.Add(1)
 	return Result{}, nil
 }
@@ -243,6 +250,7 @@ func TestReconcileOrderFollowsDependencies(t *testing.T) {
 		t.Fatal("chain did not fully converge")
 	}
 
+	// Each object applies its side effect exactly once.
 	order := r.rec.applyOrder()
 	pos := map[string]int{}
 	for i, k := range order {
@@ -251,10 +259,27 @@ func TestReconcileOrderFollowsDependencies(t *testing.T) {
 		}
 		pos[k] = i
 	}
-	if !(pos["ns/root"] < pos["ns/mid"] && pos["ns/mid"] < pos["ns/leaf"]) {
-		t.Fatalf("apply order must be root<mid<leaf, got %v", order)
+
+	// Under several workers the interleaving of "worker reaches apply" and
+	// "write commit" makes the raw wall-clock order of apply-branch entry a
+	// racy thing to assert. The actual ordering guarantee is causal: the store
+	// assigns a globally monotonic resource version on each write, and a
+	// dependent's Ready write is admitted only AFTER its dependency's Ready
+	// write has been observed committed. Hence readyRV(root) < readyRV(mid) <
+	// readyRV(leaf) must hold.
+	rv := func(k string) int64 {
+		o, err := r.store.Get(ctx, k)
+		if err != nil || o == nil {
+			t.Fatalf("get %s: %v", k, err)
+		}
+		return o.ResourceVersion
 	}
-	fmt.Printf("INPUT chain leaf->mid->root | JUDGE: apply order=%v\n", order)
+	if !(rv("ns/root") < rv("ns/mid") && rv("ns/mid") < rv("ns/leaf")) {
+		t.Fatalf("ready-write causal order must be root<mid<leaf, got root=%d mid=%d leaf=%d; applyOrder=%v",
+			rv("ns/root"), rv("ns/mid"), rv("ns/leaf"), order)
+	}
+	fmt.Printf("INPUT chain leaf->mid->root | JUDGE: ready-write causal order rv root<%d mid<%d leaf (apply=%v)\n",
+		rv("ns/mid"), rv("ns/leaf"), order)
 
 	// Depended-on objects must carry the guard finalizer.
 	for _, k := range []string{"ns/root", "ns/mid"} {
@@ -480,15 +505,31 @@ func TestDependencyCycleTerminalThenBroken(t *testing.T) {
 	createObj(t, ctx, s, "ns", "c", object.DependencyRef{Name: "a"})
 
 	members := []string{"ns/a", "ns/b", "ns/c"}
+
+	// All three declarations must be ingested by the graph before the reason is
+	// judged: with several workers already draining the queue, a member can be
+	// gated against a partially-ingested graph and briefly record
+	// DependencyMissing, which self-corrects once the last node's watch event
+	// re-enqueues it. Wait for every member to reach the *stable* conclusion.
 	if !waitFor(2*time.Second, func() bool {
 		for _, k := range members {
-			if r.ctrl.Failures()[k] == nil {
+			f, ok := r.ctrl.Failures()[k].(*TerminalFailure)
+			if !ok || f.Reason != ReasonDependencyCycle {
 				return false
 			}
 		}
 		return true
 	}) {
-		t.Fatalf("all cycle members must terminate, got %v", r.ctrl.Failures())
+		t.Fatalf("all cycle members must reach a stable DependencyCycle, got %v", r.ctrl.Failures())
+	}
+	// Hold the stable state for a while to prove it does not flicker away.
+	for i := 0; i < 10; i++ {
+		time.Sleep(10 * time.Millisecond)
+		for _, k := range members {
+			if r.ctrl.Failures()[k] == nil {
+				t.Fatalf("%s cycle conclusion flickered away; failures=%v", k, r.ctrl.Failures())
+			}
+		}
 	}
 	for _, k := range members {
 		f := r.ctrl.Failures()[k].(*TerminalFailure)
@@ -667,6 +708,8 @@ func TestChainReverseDeletion(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	rec := newDeleteOrderRecorder(t, ctx, s)
 	// Request deletion of all three, in dependency (forward) order.
 	del("ns/root")
 	del("ns/mid")
@@ -693,5 +736,13 @@ func TestChainReverseDeletion(t *testing.T) {
 	}) {
 		t.Fatal("root must be removed only after its dependents cleared")
 	}
-	fmt.Printf("INPUT delete root,mid,leaf together | JUDGE: removed leaf<mid<root (reverse order)\n")
+
+	// Assert the ACTUAL physical-removal order, not just the final state.
+	order := rec.waitRecorded(t, "ns/leaf", "ns/mid", "ns/root")
+	if !(indexOf(order, "ns/leaf") >= 0 &&
+		indexOf(order, "ns/leaf") < indexOf(order, "ns/mid") &&
+		indexOf(order, "ns/mid") < indexOf(order, "ns/root")) {
+		t.Fatalf("physical deletion order must be leaf<mid<root, got %v", order)
+	}
+	fmt.Printf("INPUT delete root,mid,leaf together | JUDGE: physical removal order=%v (reverse order)\n", order)
 }

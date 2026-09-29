@@ -37,8 +37,10 @@ const (
 
 // GuardFinalizer is the engine-managed finalizer that enforces reverse
 // deletion order: it is added to every live object that currently has
-// dependents, so such an object cannot physically disappear until its
-// dependents have been deleted. It is removed automatically once no
+// dependents, so such an object cannot physically disappear until every
+// dependent has itself physically disappeared. A dependent merely marked for
+// deletion (still present in the store) keeps blocking; only its actual
+// removal unblocks this object. The guard is removed automatically once no
 // dependent remains, without app reconciler cooperation.
 const GuardFinalizer = "reconcile-engine.io/dependency-guard"
 

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,10 +171,18 @@ func (c *Controller) pumpLoop(ctx context.Context) {
 				}
 			}
 		case store.EventDelete:
-			dependents := c.graph.Delete(ev.Key)
+			dependents, dependencies := c.graph.Delete(ev.Key)
 			admit(ev.Key, queue.EnqueueOptions{})
 			for _, dk := range dependents {
 				admit(dk, queue.EnqueueOptions{})
+			}
+			// A physical removal may release an upstream object that was itself
+			// deleting and blocked on this key. Wake it immediately so chain
+			// teardown continues without waiting for a poll tick.
+			for _, up := range dependencies {
+				if up != ev.Key {
+					admit(up, queue.EnqueueOptions{})
+				}
 			}
 		}
 	}
@@ -429,16 +438,25 @@ func (c *Controller) processDeletion(ctx context.Context, id int, obj *object.Ob
 
 	// Deletion safety is decided against the authoritative store, not only the
 	// (derived, briefly-asynchronous) reverse index: an object may be removed
-	// only once no LIVE object still references it. A dependent that is itself
-	// deleting does not block it, so a chain tears down leaf-first.
-	blocked, err := c.hasLiveDependent(ctx, key)
+	// only once every object that still references it has itself PHYSICALLY
+	// disappeared. A dependent that has merely been marked for deletion is
+	// still present in the store and therefore still blocks — "a delete request
+	// was received" is never enough. This is what guarantees, even with many
+	// workers processing concurrent delete requests, that a chain/fan-in tears
+	// down leaf-first.
+	blocked, blockers, err := c.hasRemainingDependent(ctx, key)
 	if err != nil {
 		c.log("worker %d: dependent scan failed for deleting %s (%v) -> wait", id, key, err)
 		c.cfg.Queue.RequeueWith(key, c.cfg.DependencyWaitDelay)
 		return false
 	}
 	if blocked {
-		c.log("worker %d: %s deleting but still has a live dependent -> keep guard, wait", id, key)
+		c.log("worker %d: %s deleting but still has %d present dependent/s %v -> keep guard, wait",
+			id, key, len(blockers), blockers)
+		// Remain parked in the deleting state. Physical removal of any
+		// dependent re-enqueues this key via the watch, and this periodic wait
+		// is a belt-and-braces fallback; no backoff attempt is consumed and the
+		// object stays observable.
 		c.cfg.Queue.RequeueWith(key, c.cfg.DependencyWaitDelay)
 		return false
 	}
@@ -460,28 +478,32 @@ func (c *Controller) processDeletion(ctx context.Context, id int, obj *object.Ob
 	return true
 }
 
-// hasLiveDependent reports whether any object currently present in the store
-// declares key as a dependency and is not itself being deleted. A deleting
-// dependent is already tearing down and therefore must not block key's own
-// removal (this is what makes a dependency chain delete leaf-first). This
-// consults the source of truth, avoiding a transient gap in the graph's
-// reverse index during event processing.
-func (c *Controller) hasLiveDependent(ctx context.Context, key string) (bool, error) {
+// hasRemainingDependent reports whether any object currently PRESENT in the
+// store — alive OR still being deleted — declares key as a dependency. Only a
+// dependent that has physically disappeared stops blocking. This consults the
+// source of truth, avoiding a transient gap in the graph's reverse index
+// during event processing; the returned blocker keys make the wait
+// observable. A self-reference never blocks its own removal (it is a cycle,
+// reported through the normal cycle path while alive).
+func (c *Controller) hasRemainingDependent(ctx context.Context, key string) (bool, []string, error) {
 	objs, err := c.cfg.Store.List(ctx)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
+	var blockers []string
 	for _, o := range objs {
-		if o.Key() == key || o.BeingDeleted() {
+		if o.Key() == key {
 			continue
 		}
 		for _, ref := range dependency.NormalizeRefs(o.Namespace, o.Dependencies) {
 			if ref == key {
-				return true, nil
+				blockers = append(blockers, o.Key())
+				break
 			}
 		}
 	}
-	return false, nil
+	sort.Strings(blockers)
+	return len(blockers) > 0, blockers, nil
 }
 
 // recordIfTerminal promotes a queue terminal error into the controller's

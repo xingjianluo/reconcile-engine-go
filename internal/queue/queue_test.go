@@ -138,6 +138,50 @@ func TestNewChangeRevivesFailedKey(t *testing.T) {
 	fmt.Println("INPUT failure then newer rv=2 | JUDGE: failure cleared, key re-queued")
 }
 
+// TestFailWhileDirtyRequeues verifies that a terminal Fail verdict produced
+// while a newer trigger had already merged into the in-flight item does NOT
+// strand the key: the verdict was computed against a superseded generation, so
+// the key must be re-queued runnable to re-evaluate against the newest state.
+func TestFailWhileDirtyRequeues(t *testing.T) {
+	q := newTestQueue(t, Config{})
+	q.Add("k", EnqueueOptions{})
+	k, _ := q.Get(context.Background())
+
+	// A newer change merges in while k is in flight (marks it dirty).
+	q.Add("k", EnqueueOptions{})
+
+	// The worker reaches a terminal conclusion for the stale generation.
+	q.Fail(k, errors.New("terminal on stale generation"))
+
+	if f := q.Failures()["k"]; f != nil {
+		t.Fatalf("dirty key must not be parked as terminally failed, got %v", f)
+	}
+	if q.Runnable() != 1 {
+		t.Fatalf("dirty key must be re-queued runnable, runnable=%d", q.Runnable())
+	}
+	got, ok := q.Get(context.Background())
+	if !ok || got != "k" {
+		t.Fatalf("expected k re-delivered, got %q ok=%v", got, ok)
+	}
+	q.Done(got)
+	fmt.Println("INPUT Fail while newer trigger merged | JUDGE: key re-queued, no stale terminal")
+}
+
+// TestFailWithoutDirtyIsTerminal verifies the normal path is unchanged: a Fail
+// with no merged newer trigger parks the key terminally.
+func TestFailWithoutDirtyIsTerminal(t *testing.T) {
+	q := newTestQueue(t, Config{})
+	q.Add("k", EnqueueOptions{})
+	k, _ := q.Get(context.Background())
+	q.Fail(k, errors.New("boom"))
+	if f := q.Failures()["k"]; f == nil {
+		t.Fatal("key without a merged trigger must be terminally failed")
+	}
+	if q.Len() != 0 {
+		t.Fatalf("terminal key must not be re-queued, len=%d", q.Len())
+	}
+}
+
 // TestBoundedCapacityDoesNotDrop verifies a saturated queue blocks producers
 // until a slot frees, never silently losing an item.
 func TestBoundedCapacityDoesNotDrop(t *testing.T) {

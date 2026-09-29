@@ -74,6 +74,11 @@ func (r *fakeReconciler) Reconcile(ctx context.Context, obj *object.Object) (Res
 	if err != nil {
 		return Result{}, err
 	}
+	// Count the side effect by the identity of this apply branch: a converged
+	// object returns above and never reaches here, so this is exactly one per
+	// object regardless of conflict/retries. It is incremented synchronously
+	// before returning so an external observer that sees convergence has also
+	// necessarily seen the count.
 	r.sideEffects.Add(1)
 	fmt.Printf("      [app] side effect applied rv=%d status=%v\n", out.ResourceVersion, out.Status)
 	return Result{}, nil
@@ -158,7 +163,19 @@ func TestConcurrentReconcileConverges(t *testing.T) {
 		}
 	}
 
+	// Require a STABLE, drained convergence: an object becomes observable as
+	// converged the instant its CAS write lands, which is a few instructions
+	// before that reconcile returns and increments the counter. Sampling once at
+	// that moment could therefore see all objects converged while one apply is
+	// still in flight. Wait until nothing is queued/in-flight and the count
+	// holds at n, which cannot be true until every apply has fully returned.
 	ok := waitFor(2*time.Second, func() bool {
+		if r.queue.WorkSet() != 0 || r.ctrl.InFlight() != 0 {
+			return false
+		}
+		if rec.sideEffects.Load() != n {
+			return false
+		}
 		objs, _ := r.store.List(ctx)
 		if len(objs) != n {
 			return false
@@ -170,13 +187,19 @@ func TestConcurrentReconcileConverges(t *testing.T) {
 		}
 		return true
 	})
+	// Sample the count twice with a short gap: a still-running apply would
+	// advance it between the two reads.
+	first := rec.sideEffects.Load()
+	time.Sleep(20 * time.Millisecond)
+	second := rec.sideEffects.Load()
 	fmt.Printf("INPUT %d objects, 4 workers | JUDGE: all converged=%v sideEffects=%d (one per object)\n",
-		n, ok, rec.sideEffects.Load())
+		n, ok, second)
 	if !ok {
-		t.Fatal("not all objects converged")
+		t.Fatalf("did not reach stable convergence: sideEffects=%d->%d failures=%v",
+			first, second, r.ctrl.Failures())
 	}
-	if rec.sideEffects.Load() != n {
-		t.Fatalf("expected exactly %d convergence writes, got %d", n, rec.sideEffects.Load())
+	if first != n || second != n {
+		t.Fatalf("expected exactly %d convergence writes, got %d then %d", n, first, second)
 	}
 }
 
@@ -210,12 +233,27 @@ func TestCoalescedBurstProcessesLatestVersion(t *testing.T) {
 		})
 	}
 
+	// Require the queue fully drained AND the final state held across several
+	// reads: status=="20" observed while an earlier reconcile is still in flight
+	// could transiently hold while the latest event is still pending. Drained +
+	// stable proves no later reconcile can change the result.
 	ok := waitFor(2*time.Second, func() bool {
+		if r.queue.WorkSet() != 0 || r.ctrl.InFlight() != 0 {
+			return false
+		}
 		o, err := r.store.Get(ctx, key)
 		return err == nil && o.Status["rev"] == "20" && o.HasFinalizer(testFinalizer)
 	})
+	// Hold the final value for a while to prove it does not regress.
+	for i := 0; i < 10; i++ {
+		time.Sleep(5 * time.Millisecond)
+		o, err := r.store.Get(ctx, key)
+		if err != nil || o.Status["rev"] != "20" {
+			t.Fatalf("final status regressed to %v err=%v", o, err)
+		}
+	}
 	o, _ := r.store.Get(ctx, key)
-	fmt.Printf("INPUT 20 rapid updates | JUDGE: final status rev=%s (want 20), converged=%v\n",
+	fmt.Printf("INPUT 20 rapid updates | JUDGE: final status rev=%s (want 20), converged=%v, held stable\n",
 		o.Status["rev"], ok)
 	if !ok {
 		t.Fatal("final state did not converge to latest desired version")
@@ -253,12 +291,23 @@ func TestFinalizerDeletionEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("INPUT Delete rv=%d | JUDGE: object remains deleting=%t finalizers=%v\n",
+	if !marked.BeingDeleted() || !marked.HasFinalizer(testFinalizer) {
+		t.Fatalf("Delete with a finalizer must only mark: got deleting=%t finalizers=%v",
+			marked.BeingDeleted(), marked.Finalizers)
+	}
+	fmt.Printf("INPUT Delete rv=%d | JUDGE: Delete only marked (deleting=%t, finalizers=%v retained)\n",
 		cur.ResourceVersion, marked.BeingDeleted(), marked.Finalizers)
 
-	// It must not disappear immediately.
-	if _, err := r.store.Get(ctx, key); err != nil {
-		t.Fatalf("object vanished before finalizer cleared: %v", err)
+	// A single worker with tiny backoffs may complete the whole
+	// finalizer-clear -> physical-remove sequence before the next line runs, so
+	// presence at this instant cannot be asserted. What must be proven is that
+	// removal requires the finalizer sequence: either the object is still
+	// deleting (not yet finished) or it has since disappeared — and never while
+	// still carrying the finalizer is it deletable by the store.
+	if now, err := r.store.Get(ctx, key); err == nil {
+		if !now.BeingDeleted() {
+			t.Fatalf("post-Delete object must be deleting, got %v", now)
+		}
 	}
 
 	gone := waitFor(2*time.Second, func() bool {

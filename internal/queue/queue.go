@@ -469,17 +469,34 @@ func (q *BasicQueue) RequeueWith(key string, delay time.Duration) {
 	q.broadcastLocked()
 }
 
-// Fail records an explicit terminal failure for an in-flight key.
+// Fail records an explicit terminal failure for an in-flight key. If a newer
+// trigger merged in while the key was being processed (dirty), the conclusion
+// was reached against a superseded generation: the key is re-queued to
+// re-evaluate against the newest state instead of being parked terminally.
 func (q *BasicQueue) Fail(key string, reason error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if _, ok := q.inFlight[key]; !ok {
+	it, ok := q.inFlight[key]
+	if !ok {
 		return
 	}
 	delete(q.inFlight, key)
 	q.notFull.Broadcast()
 	if reason == nil {
 		reason = errors.New("unspecified failure")
+	}
+
+	if it.dirty {
+		// A fresher trigger arrived mid-processing: retry the runnable key
+		// immediately so a terminal verdict computed for a stale generation
+		// cannot strand it. Capacity already covered this in-flight key.
+		it.dirty = false
+		it.attempts = 0
+		it.lastErr = nil
+		it.readyAt = time.Time{}
+		q.waiting[key] = it
+		q.broadcastLocked()
+		return
 	}
 	q.failures[key] = reason
 	q.broadcastLocked()

@@ -12,7 +12,9 @@
 - 失败任务**限流 + 单调退避**重入队；队列**有界不丢**；关闭时在途调谐
   **可观察并优雅收敛**。
 - **资源依赖编排**：依赖未就绪时安静等待；依赖变化自动向下传播；删除按
-  **依赖逆序**进行；**引用缺失 / 成环**给出可区分、可观察、不卡死的结论；
+  **依赖逆序**进行——被依赖的对象必须等**每一个**依赖方（哪怕其自身也在
+  删除中）彻底物理消失后才会消失，依赖方全部删完后被依赖方自动接力删除；
+  **引用缺失 / 成环**给出可区分、可观察、不卡死的结论；
   高并发与依赖等待下队列与内存**有界**。
 
 ## 目录结构
@@ -41,6 +43,29 @@ go run ./cmd/demo
 
 测试输出中每一步都带有 `INPUT ... | JUDGE: ...`，明确给出输入条件与判定依据。
 重复运行结果一致（`go test -count=N ./...`）。
+
+### 本地怎么验证删除先后规则
+
+删除顺序相关用例直接对**真实物理删除顺序**做断言（测试在发起删除前订阅
+watch，用一个独立协程持续排空事件、记录每个 `EventDelete` 的实际发生顺序），
+而不是只断言"最终都没了"：
+
+```bash
+# 三层链并发删、一个根被多个依赖方依赖、多轮扇入压力、
+# 删除中依赖方保留/接力、重复删除请求
+go test -race -count=1 -run 'Deletion|ReverseOrder' ./internal/reconcile/ -v
+
+# 连续多轮 + 竞态检测，确认不靠运气
+go test -race -count=100 ./internal/reconcile/
+```
+
+判定要点：
+
+- 链 `leaf -> mid -> root` 一次性并发删，物理删除序列严格为 `leaf, mid, root`；
+- `root` 被多个对象依赖时，无论删除请求怎么并发，`root` 一定排在所有依赖方之后；
+- 依赖方"已收到删除请求但还没物理消失"期间，被依赖方始终以
+  `deleting=true` 且带守护终结器的状态存在，`EventDelete` 序列里不允许有它；
+- 依赖方删完后被依赖方自动消失（顺序断言天然覆盖）；重复发 Delete 不放行。
 
 ## 调谐协议（Reconciliation Protocol）
 
@@ -97,6 +122,9 @@ go run ./cmd/demo
   - `ReasonReconcileError`：读取等不可重试错误。
   错误通过 `errors.Is/As` 与原始 cause 可判定、可追踪，**不是静默丢弃**。
 - 新一代期望状态（更新版本）到达一个已终结失败的 key 时，旧结论被清除并重新调谐。
+  若新触发恰好在该 key 的上一次处理进行中并入（dirty），而那次处理得出的是
+  终结结论（如依赖缺失/成环），队列也会按**最新一代**立即重跑，而不会把一个
+  针对过期状态得出的结论永久挂住（`TestFailWhileDirtyRequeues`）。
 - **有界不丢**：队列容量饱和时 `Add` 阻塞等待空位，而不是丢弃任务。
 
 ## 删除顺序规则（Finalizer Deletion Ordering）
@@ -146,21 +174,42 @@ go run ./cmd/demo
   触发只置脏标记，`Done` 后至多再跑一次；已收敛对象被重复触发时不产生重复副作用。
   证据：`TestDependencyChangePropagatesDownstream`、`TestCoalescedDependencyTriggers`。
 
-### 删除顺序规则（逆序）
+### 删除顺序规则（逆序：先删干净依赖方，再删被依赖方）
 
 引擎用一个**引擎自管的守护终结器** `reconcile.GuardFinalizer` 强制逆序删除，
-应用调谐器无需感知它：
+应用调谐器无需感知它。判定依据是**权威存储**（而不是派生、可能短暂滞后的
+反向索引），规则只有一条：**只要存储里还存在任何一个声明依赖该对象的对象，
+该对象就不能物理消失**。
 
 1. 一个**存活且当前有依赖方**的对象，在其依赖已就绪后会被自动加上守护终结器
    （存活期单调：至多添加一次，不做增删抖动，因此不会产生重复副作用）。
-2. 删除一个仍被依赖的对象时，只要它还有存活的依赖方，它就被**保留为删除中**、
-   守护终结器不摘除，物理删除被阻塞——依赖方不清完，它不能真正消失。
-3. 依赖方陆续删除、图中不再有依赖方后，引擎摘除守护终结器；随后应用终结器完成
-   清理、对象才物理删除。链式依赖因此按 **叶子 → … → 根** 的逆序消失。
-4. 极端情况下若对象在守护终结器加上之前就被请求删除（无终结器会立即消失），
+2. 删除一个仍被依赖的对象时，引擎扫描整个存储：**每一个**还在的依赖方
+   （无论它自己是存活、还是也已进入"删除中"）都算数。此时该对象被
+   **保留为删除中**、守护终结器不摘除、物理删除被阻塞——**"依赖方收到了
+   删除请求 / 已被标记为删除"不算数，它必须自己先彻底物理消失**。
+   因此多层链按 **叶子 → … → 根** 的顺序逐层消失，扇入（多个对象依赖
+   同一个根）时根一定最后消失；多个删除请求并发、多个 worker 同时处理时，
+   判定在每次尝试时重新做，顺序同样成立。
+3. **重复提交同一个删除请求不会让被依赖的对象提前消失**：删除标记是幂等的，
+   是否放行只取决于"存储里是否还有依赖方"，与收到多少次 Delete 无关。
+4. 每当某个依赖方**物理消失**，其删除事件沿图的出边立即唤醒正在等待的上游
+   对象（同时保留 `DependencyWaitDelay` 周期重检作为兜底）：最后一个依赖方
+   消失后，被依赖对象自动摘除守护终结器、继续走完它自己的清理与物理删除，
+   **无需人工再操作，也不会卡住或残留**。
+5. 反过来，依赖方迟迟删不完（例如它自己的清理卡住、终结器一直挂着），
+   被依赖对象就**一直以"删除中 + 守护终结器就位"的可观察状态保留**，
+   守护终结器不会来回增删（不抖动），对象也不会悄悄消失。
+6. 极端情况下若对象在守护终结器加上之前就被请求删除（无终结器会立即消失），
    依赖方下一轮会观测到「依赖缺失」的明确结论（见下），同样不会状态错乱或卡死。
 
-证据：`TestReverseOrderDeletion`、`TestChainReverseDeletion`。
+直接断言**真实物理删除先后顺序**（通过 watch 记录的 `EventDelete` 序列，而
+不是"最后都删掉了"）的证据：`TestDeletionOrderChain`（三层链、并发删）、
+`TestDeletionOrderFanIn`（一根被 4 个依赖方依赖、并发删）、
+`TestDeletionOrderStress`（多轮扇入，每轮断言根最后消失）、
+`TestChainReverseDeletion`、`TestReverseOrderDeletion`；
+`TestDeletionWaitsForDeletingDependent`（依赖方删除中且清理缓慢 → 被依赖方
+持续保留可观察、随后自动接力删除）、`TestDuplicateDeleteRequestsDoNotReleaseGuard`
+（重复删除请求不会提前放行）。
 
 ### 依赖缺失与成环：可区分、可观察、不卡死
 
@@ -216,7 +265,10 @@ worker 退出。期间进行中的调谐数量可通过 `Controller.InFlight()` 
 | 依赖未就绪安静等待、就绪后自动继续 | `TestDependencyWaitThenProceed` |
 | 调谐按依赖顺序、守护终结器就位 | `TestReconcileOrderFollowsDependencies` |
 | 依赖变化向下传播、结果一致、幂等 | `TestDependencyChangePropagatesDownstream`、`TestCoalescedDependencyTriggers` |
-| 删除按依赖逆序（单级 / 链式） | `TestReverseOrderDeletion`、`TestChainReverseDeletion` |
+| 删除按依赖逆序（真实物理顺序：单级 / 链式 / 扇入 / 多轮并发） | `TestReverseOrderDeletion`、`TestChainReverseDeletion`、`TestDeletionOrderChain`、`TestDeletionOrderFanIn`、`TestDeletionOrderStress` |
+| 删除中的依赖方仍未删干净时，被依赖方持续保留且可观察，随后自动接力 | `TestDeletionWaitsForDeletingDependent` |
+| 重复删除请求不会提前放行被依赖方 | `TestDuplicateDeleteRequestsDoNotReleaseGuard` |
+| 到达终结结论时若已有更新一代触发并入，必须按新状态重判 | 队列层 `TestFailWhileDirtyRequeues`（对照 `TestFailWithoutDirtyIsTerminal`） |
 | 依赖缺失：可区分失败 + 创建后自动恢复 | `TestMissingDependencyTerminalThenResolved` |
 | 依赖成环：可区分失败 + 拆边后恢复 | `TestDependencyCycleTerminalThenBroken` |
 | 高并发 + 依赖等待下有界不堆积、不饥饿 | `TestBoundedUnderDependencyLoad` |

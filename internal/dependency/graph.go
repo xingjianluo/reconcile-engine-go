@@ -145,12 +145,17 @@ type SnapshotEntry struct {
 	Deleting bool
 }
 
-// Delete removes key's node and its outgoing edges and returns the sorted
-// keys that declared key as a dependency, so the caller can re-enqueue them
-// (they now observe a missing dependency). Incoming references are kept in
-// the reverse index: they are still declared and must propagate again if key
-// is ever recreated.
-func (g *Graph) Delete(key string) []string {
+// Delete removes key's node and its outgoing edges. It returns two sorted
+// snapshots:
+//   - dependents: keys that declared key as a dependency, so the caller can
+//     re-enqueue them (they now observe a missing dependency). Incoming
+//     references are kept in the reverse index: they are still declared and
+//     must propagate again if key is ever recreated.
+//   - dependencies: keys key itself declared. When key is physically removed,
+//     its own (possibly deleting) dependencies must be re-enqueued at once so
+//     they can re-evaluate whether their last dependent just disappeared;
+//     without this notification they would only notice via delayed polling.
+func (g *Graph) Delete(key string) (dependents, dependencies []string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -164,11 +169,12 @@ func (g *Graph) Delete(key string) []string {
 				}
 			}
 		}
+		dependencies = append([]string(nil), n.deps...)
 		delete(g.nodes, key)
 	}
 
-	dependents := g.sortedDependentsLocked(key)
-	return dependents
+	dependents = g.sortedDependentsLocked(key)
+	return dependents, dependencies
 }
 
 // Dependents returns a sorted snapshot of keys that declare dep as a
